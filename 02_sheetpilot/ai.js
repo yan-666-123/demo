@@ -476,6 +476,10 @@
     const s = A.sheet();
     if (!s) return { text: '还没有载入数据。**先导入 Excel 或 CSV 文件**，我就能开始分析。' };
     if (s.rows.length < 2) return { text: '当前工作表只有表头、没有数据行，暂时无法分析。' };
+    // 有行但全是空行（比如刚新建的空白表）：也说清楚，别报"共 0 行 × 3 列"
+    if (!s.rows.slice(1).some(r => (r || []).some(v => A.cellText(v).trim()))) {
+      return { text: '这张表还没有数据 —— 双击单元格录入，或把 Excel / CSV 拖进来，我再帮你分析。' };
+    }
     const D = deepStats();
     const head = A.header();
     const n = D.body.length;
@@ -679,7 +683,9 @@ type 只能取 bar / line / pie / scatter；agg 只能取 sum / avg / count。
   let busy = false;
 
   async function callModel(messages, onDelta) {
-    const url = cfg.baseUrl.replace(/\/+$/, '') + '/chat/completions';
+    // 兼容两种填法：Base URL（自动补 /chat/completions）或直接填完整接口地址
+    let url = cfg.baseUrl.replace(/\/+$/, '');
+    if (!/\/chat\/completions$/.test(url)) url += '/chat/completions';
     const body = {
       model: cfg.model,
       messages,
@@ -720,23 +726,34 @@ type 只能取 bar / line / pie / scatter；agg 只能取 sum / avg / count。
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        const l = line.trim();
-        if (!l.startsWith('data:')) continue;
-        const data = l.slice(5).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const j = JSON.parse(data);
-          const d = j.choices?.[0]?.delta?.content || j.choices?.[0]?.text || '';
-          if (d) onDelta(d);
-        } catch (e) { }
+    // 流式读取的空闲看门狗：模型卡住不吐字时 60 秒后中断，避免界面一直转圈
+    let idle = setTimeout(() => ctrl.abort(), 60000);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        clearTimeout(idle);
+        idle = setTimeout(() => ctrl.abort(), 60000);
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const l = line.trim();
+          if (!l.startsWith('data:')) continue;
+          const data = l.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const j = JSON.parse(data);
+            const d = j.choices?.[0]?.delta?.content || j.choices?.[0]?.text || '';
+            if (d) onDelta(d);
+          } catch (e) { }
+        }
       }
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('STALL');
+      throw e;
+    } finally {
+      clearTimeout(idle);
     }
   }
 
@@ -798,7 +815,9 @@ type 只能取 bar / line / pie / scatter；agg 只能取 sum / avg / count。
         ? '无法连接模型接口。可能是网络问题，或该服务不允许浏览器直接调用（CORS）。可改用支持跨域的代理地址，或换一个服务商。'
         : err.message === 'TIMEOUT'
           ? '模型响应超时（90 秒）。请稍后重试，或换用响应更快的模型。'
-          : err.message;
+          : err.message === 'STALL'
+            ? '模型长时间没有返回数据，已自动中断。可以重试，或换一个响应更快的模型。'
+            : err.message;
       bubble.innerHTML = `<div style="color:var(--red);font-weight:600;margin-bottom:4px">请求失败</div>
         <div style="font-size:12px;line-height:1.6">${esc(msg)}</div>
         <div style="margin-top:8px"><button class="btn sm" onclick="window.App.ai.openSettings()">检查模型设置</button></div>`;

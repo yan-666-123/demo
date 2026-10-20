@@ -209,12 +209,12 @@
     const body = s.rows;
     let idx = [];
     for (let i = 1; i < body.length; i++) idx.push(i);
-    const activeFilters = Object.entries(state.filters).filter(([, v]) => Array.isArray(v));
+    // Set 只建一次：以前每行每列都 new 一个 Set，几万行时是明显的性能陷阱
+    const activeFilters = Object.entries(state.filters)
+      .filter(([, v]) => Array.isArray(v))
+      .map(([c, v]) => [+c, new Set(v)]);
     if (activeFilters.length) {
-      idx = idx.filter(i => activeFilters.every(([c, allowed]) => {
-        const set = new Set(allowed);
-        return set.has(cellText(body[i][+c]).trim());
-      }));
+      idx = idx.filter(i => activeFilters.every(([c, set]) => set.has(cellText((body[i] || [])[c]).trim())));
     }
     if (state.search) {
       const q = state.search.toLowerCase();
@@ -235,7 +235,15 @@
   function pushHistory() {
     try {
       const cells = state.sheets.reduce((a, s) => a + s.rows.length * Math.max(1, s.rows[0] ? s.rows[0].length : 1), 0);
-      if (cells > 260000) { updateUndoUI(); return; } // 超大表跳过快照，避免内存占用
+      if (cells > 260000) {
+        // 超大表跳过快照，避免内存占用；但必须提示，否则用户会以为撤销按钮坏了
+        if (Date.now() - (state._undoTipAt || 0) > 15000) {
+          state._undoTipAt = Date.now();
+          toast('这张表超过 26 万个单元格，为省内存不记录撤销', 'err');
+        }
+        updateUndoUI();
+        return;
+      }
       state.history.push(snapshot());
       if (state.history.length > HISTORY_LIMIT) state.history.shift();
       state.future.length = 0;
@@ -306,8 +314,9 @@
   /** 某张表除表头外是否还有任何内容（新建的空白表为 false） */
   function sheetHasData(sh) {
     if (!sh || !sh.rows) return false;
-    const body = sh.rows.slice(1, 401);
-    for (const r of body) {
+    // 全表扫描（命中第一格非空即返回），不能只看前几百行，否则前面全空、后面有数据时会被误判成空白表
+    for (let i = 1; i < sh.rows.length; i++) {
+      const r = sh.rows[i];
       if (!r) continue;
       for (let j = 0; j < r.length; j++) if (cellText(r[j]).trim()) return true;
     }
@@ -448,7 +457,8 @@
   function renderTable() {
     const table = $('#grid');
     const s = sheet();
-    const blank = !!s && !hasAnyData();
+    const any = !!s && hasAnyData();      // 只算一次，下面两处都用它
+    const blank = !!s && !any;
     // 没有工作表、或工作表还是空白时，都显示和起始页一样的空面板（除非用户点了「直接录入」）
     if (!s || (blank && !state.manualEdit)) {
       table.innerHTML = '';
@@ -476,7 +486,7 @@
     const tip0 = $('#panelTip'); if (tip0) tip0.style.display = 'none';
     // 空白表点了「直接录入」：顶部给一条轻提示，录入任意内容后自动消失
     const hint = $('#blankHint');
-    if (hint) hint.style.display = hasAnyData() ? 'none' : 'flex';
+    if (hint) hint.style.display = any ? 'none' : 'flex';
     $('#pager').style.display = 'flex';
 
     const cols = colCount();
@@ -1021,9 +1031,11 @@
   function insertColumn(col, side) {
     const at = side === 'left' ? col : col + 1;
     mutate(() => {
+      const width = Math.max(1, colCount());
+      const idx = Math.max(0, Math.min(at, width));   // 先按当前宽度补齐，避免长短行插出参差的列
       rows().forEach((r, i) => {
-        while (r.length < at) r.push('');
-        r.splice(at, 0, i === 0 ? `新列${at + 1}` : '');
+        while (r.length < width) r.push('');
+        r.splice(idx, 0, i === 0 ? `新列${idx + 1}` : '');
       });
     });
     toast('已插入列', 'ok');
@@ -1362,6 +1374,7 @@
 
   function openChartModal(preset) {
     if (!sheet()) { toast('请先导入数据', 'err'); return; }
+    if (!hasAnyData()) { toast('这张表还没有数据，先录入或导入数据再出图', 'err'); return; }
     const cols = colCount();
     const head = [];
     for (let c = 0; c < cols; c++) head.push({ i: c, name: header()[c] || colLetter(c), type: colType(c) });
@@ -1426,6 +1439,7 @@
    * ========================================================== */
   function openStatsModal() {
     if (!sheet()) { toast('请先导入数据', 'err'); return; }
+    if (!hasAnyData()) { toast('这张表还没有数据，统计暂时没有内容', 'err'); return; }
     const cols = colCount();
     let html = '<div style="max-height:52vh;overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">';
     html += '<thead><tr style="position:sticky;top:0;background:#f8f9fb">' +
@@ -1582,6 +1596,12 @@
     }));
   }
 
+  /** 导出即视为已保存：把标签上的"未保存"小圆点去掉 */
+  function markSaved() {
+    const d = curDoc();
+    if (d && d.dirty) { d.dirty = false; renderTabs(); }
+  }
+
   function exportFile(kind) {
     if (!sheet()) { toast('没有可导出的数据', 'err'); return; }
     const base = (state.fileName || '工作表').replace(/\.[^.]+$/, '');
@@ -1596,6 +1616,7 @@
       });
       downloadBlob(new Blob(['\ufeff' + toCSV(csvRows)], { type: 'text/csv;charset=utf-8' }), `${base}_导出.csv`);
       toast('已导出 CSV', 'ok');
+      markSaved();
       return;
     }
     const wb = XLSX.utils.book_new();
@@ -1618,6 +1639,7 @@
     }
     XLSX.writeFile(wb, `${base}_已处理.xlsx`);
     toast('已导出 Excel', 'ok');
+    markSaved();
   }
 
   function toCSV(arr) {
@@ -1748,7 +1770,8 @@
           ${row('编辑', '点顶部「编辑」进入编辑模式后，单击任意单元格就能直接改；关闭编辑模式时用双击也可以改。Enter 确认、Esc 取消，选中格按 Delete 清空，Ctrl+V 可整块粘贴。')}
           ${row('列操作', '鼠标移到列头，点右侧「⋯」：排序、筛选、统计、重命名、插入/复制/删除列。')}
           ${row('筛选', '「筛选」按钮按列勾选取值；筛选只影响视图，导出时默认只导出筛选后的行。')}
-          ${row('导出', '「导出」可选择当前表（含筛选）、全部工作表或 CSV。')}
+          ${row('导出', '「导出」可选择当前表（含筛选）、全部工作表或 CSV。导出成功后标签上的「未保存」圆点会消失。')}
+          ${row('数据保存', '表格和修改只保存在当前页面的内存里，刷新或关闭页面就会丢失（模型配置除外）。要留存请先「导出」成 Excel。')}
           <h4 style="margin:14px 0 6px;font-size:12.5px;color:var(--text)">AI 分析</h4>
           ${row('开箱可用', '未配置模型时使用内置分析引擎：数据概览、质量诊断、清洗方案、业务洞察、推荐图表。')}
           ${row('接入大模型', '点 AI 面板右上角齿轮，填入任意 OpenAI 兼容接口的 Base URL、模型名和 Key，支持 DeepSeek、Kimi、通义、GLM、OpenAI 等。')}
@@ -1866,6 +1889,20 @@
     $('#btnUndo').onclick = undo;
     $('#btnRedo').onclick = redo;
     $('#btnEditMode').onclick = () => setEditMode(!state.editMode);
+
+    // 窗口尺寸变化后重算列宽，避免网格右侧留白或横向滚动条不消失
+    let rsTimer = 0;
+    window.addEventListener('resize', () => {
+      clearTimeout(rsTimer);
+      rsTimer = setTimeout(() => { if (!state.editing && sheet()) renderTable(); }, 150);
+    });
+
+    // 数据只在内存里：刷新/关闭页面前提醒一次，避免整份表格白做
+    window.addEventListener('beforeunload', e => {
+      const liveHasData = !!curDoc() && hasAnyData();
+      const anySaved = state.docs.some(d => d.dirty || sheetHasData((d.sheets || [])[d.active || 0]));
+      if (liveHasData || anySaved) { e.preventDefault(); e.returnValue = ''; }
+    });
     $('#btnSortAsc').onclick = () => {
       const c = state.sel.c >= 0 ? state.sel.c : 0;
       const cur = state.sort && state.sort.col === c ? state.sort.dir : 0;
@@ -1916,11 +1953,32 @@
       const it = e.target.closest('[data-sheet]');
       if (!it) return;
       state.active = +it.dataset.sheet;
-      state.page = 1; state.filters = {}; state.search = ''; state.sel = { r: -1, c: -1 };
+      // 换表时把视图状态一起清掉：否则上一张表的排序箭头会残留在这张表的列头上
+      state.page = 1; state.filters = {}; state.search = ''; state.sort = null; state.sel = { r: -1, c: -1 };
       state.manualEdit = false;
       $('#globalSearch').value = '';
       invalidate(); refresh();
       App.ai && App.ai.onDataLoaded && App.ai.onDataLoaded();
+    });
+
+    // 编辑模式下的「单击即改」放在 mousedown：否则先 blur 提交上一格 → 重渲染 → click 落在已替换的节点上，第二个格子点不开
+    $('#tableWrap').addEventListener('mousedown', e => {
+      if (!state.editMode || e.button !== 0) return;
+      const td = e.target.closest('td[data-c]');
+      if (!td || td.querySelector('input.cell-input')) return;   // 点在正在编辑的格子上，保留原输入框
+      e.preventDefault();
+      const r = +td.dataset.r, c = +td.dataset.c;
+      // 先提交上一格（blur → mutate → 重渲染），再按坐标重新取节点
+      if (state.editing) {
+        const inp = document.querySelector('#grid input.cell-input');
+        if (inp) inp.blur();
+      }
+      state.sel = { r, c };
+      const fresh = document.querySelector(`#grid td[data-r="${r}"][data-c="${c}"]`);
+      if (!fresh) return;
+      $$('#grid td.cell-active').forEach(x => x.classList.remove('cell-active'));
+      fresh.classList.add('cell-active');
+      startEdit(fresh);
     });
 
     $('#tableWrap').addEventListener('click', e => {
@@ -1935,7 +1993,7 @@
         state.sel = { r: +td.dataset.r, c: +td.dataset.c };
         $$('#grid td.cell-active').forEach(x => x.classList.remove('cell-active'));
         td.classList.add('cell-active');
-        // 编辑模式下单击即改，不用先双击
+        // 兜底：某些环境不会派发 mousedown（如脚本触发 click）
         if (state.editMode && !state.editing) startEdit(td);
       }
     });
@@ -2054,7 +2112,9 @@
 
   function startEdit(td) {
     if (state.editing) return;
+    if (!td || !td.isConnected) return;          // 已在重渲染中被替换掉的旧节点
     const r = +td.dataset.r, c = +td.dataset.c;
+    if (!rows()[r]) { renderTable(); return; }   // 行可能已被删除/撤销掉
     const val = cellText((rows()[r] || [])[c]);
     const inp = document.createElement('input');
     inp.className = 'cell-input';
